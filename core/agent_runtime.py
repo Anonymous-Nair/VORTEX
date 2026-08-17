@@ -27,10 +27,7 @@ class AgentRuntime:
 
         for _ in range(MAX_TOOL_ROUNDS):
             self._raise_if_cancelled(cancel_event)
-            response = await self._request(
-                working,
-                cancel_event=cancel_event,
-            )
+            response = await self._request(working)
             self._raise_if_cancelled(cancel_event)
 
             content = response.get("content", "")
@@ -66,17 +63,17 @@ class AgentRuntime:
             if not normalized_calls:
                 return self._clean_text(content)
 
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": raw_calls,
-            }
-            working.append(assistant_message)
+            working.append(
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": raw_calls,
+                }
+            )
 
             seen: set[str] = set()
             for _, name, arguments, call_id in normalized_calls:
                 self._raise_if_cancelled(cancel_event)
-
                 try:
                     key = f"{call_id}|{name}|{json.dumps(arguments, sort_keys=True, default=str)}"
                 except Exception:
@@ -105,18 +102,11 @@ class AgentRuntime:
         self._raise_if_cancelled(cancel_event)
         return "I couldn't complete that operation within the allowed tool steps, sir."
 
-    async def _request(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        cancel_event: asyncio.Event | None = None,
-    ) -> dict[str, Any]:
+    async def _request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         response = await self.llm.chat(
             messages,
             tools=self.tools.definitions(),
-            cancel_event=cancel_event,
         )
-        self._raise_if_cancelled(cancel_event)
         return response if isinstance(response, dict) else {"content": "", "tool_calls": []}
 
     async def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
