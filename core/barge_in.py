@@ -11,23 +11,18 @@ class BargeInConfig:
     mic_rate: int = 16000
     mic_frame_samples: int = 320
     history_samples: int = 4800
-
     min_delay_samples: int = 320
     max_delay_samples: int = 3200
     search_step: int = 8
-
     mic_floor: float = 450.0
     residual_floor: float = 180.0
     residual_ratio: float = 2.2
     residual_margin: float = 180.0
-
     confirm_frames: int = 5
     startup_suppression_ms: float = 300.0
-
     baseline_attack: float = 0.02
     baseline_release: float = 0.10
-
-    diagnostic_only: bool = True
+    diagnostic_only: bool = False
 
 
 class BargeInDetector:
@@ -73,7 +68,6 @@ class BargeInDetector:
 
     def update(self, mic_raw: bytes, mic_energy: float, capture_time: float | None = None) -> bool:
         del capture_time
-
         if not self._active:
             return False
 
@@ -107,14 +101,8 @@ class BargeInDetector:
             r = ref - np.mean(ref)
             denom = max(float(np.dot(r, r)), 1.0)
             raw_gain = float(np.dot(m, r) / denom)
-
-            # FIX #1: Gate gain by NCC. When correlation is weak,
-            # the least-squares gain is unreliable. Scale it down
-            # so weak correlations produce near-zero echo estimates
-            # instead of destructive noise amplification.
             ncc_gate = min(max(ncc, 0.0) / 0.5, 1.0)
             gain = max(0.0, min(raw_gain * ncc_gate, 2.0))
-
             residual = m - gain * r
             residual_rms = float(np.sqrt(np.mean(residual * residual)))
 
@@ -124,12 +112,6 @@ class BargeInDetector:
             (1.0 - alpha) * self._baseline + alpha * residual_rms,
         )
 
-        # FIX #2: NCC-modulated residual threshold.
-        # When NCC is high (signal correlates with VORTEX playback),
-        # require proportionally higher residual to confirm user speech.
-        # At ncc=0.8, scale=3.0 -> residual must be 3x baseline thresholds.
-        # At ncc=0.0, scale=1.0 -> standard thresholds apply.
-        # This rejects pure echo while preserving double-talk detection.
         ncc_scale = 1.0 + min(max(ncc, 0.0), 0.8) * 2.5
         effective_ratio = self.config.residual_ratio * ncc_scale
         effective_margin = self.config.residual_margin * ncc_scale
@@ -169,8 +151,8 @@ class BargeInDetector:
                 f"gain={gain:.4f} residual={residual_rms:.0f} "
                 f"baseline={self._baseline:.0f} "
                 f"lag_ms={lag / self.config.mic_rate * 1000.0:.1f} "
-                f"scale={ncc_scale:.2f} "
-                f"{tag} frames={self._frames}/{self.config.confirm_frames}"
+                f"scale={ncc_scale:.2f} {tag} "
+                f"frames={self._frames}/{self.config.confirm_frames}"
             )
             self._last_log = now
 
@@ -207,7 +189,6 @@ class BargeInDetector:
 
         best_ncc = -1.0
         best_lag = low
-
         for lag in range(low, high + 1, self.config.search_step):
             start = len(history) - n - lag
             if start < 0:
