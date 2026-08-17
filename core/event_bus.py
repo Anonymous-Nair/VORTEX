@@ -10,9 +10,7 @@ from typing import Any
 class Event:
     type: str
     data: dict[str, Any] = field(default_factory=dict)
-    timestamp: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class EventBus:
@@ -24,21 +22,26 @@ class EventBus:
         self._queues.append(queue)
         return queue
 
-    async def publish(
-        self,
-        event_type: str,
-        **data: Any,
-    ) -> None:
-        event = Event(event_type, data)
+    def unsubscribe(self, queue: asyncio.Queue[Event]) -> bool:
+        """Remove a subscriber queue; safe to call more than once."""
+        try:
+            self._queues.remove(queue)
+        except ValueError:
+            return False
+        return True
 
+    async def publish(self, event_type: str, **data: Any) -> None:
+        event = Event(event_type, data)
         dead: list[asyncio.Queue[Event]] = []
 
-        for queue in self._queues:
+        for queue in tuple(self._queues):
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 dead.append(queue)
 
         for queue in dead:
-            if queue in self._queues:
-                self._queues.remove(queue)
+            self.unsubscribe(queue)
+
+    def subscriber_count(self) -> int:
+        return len(self._queues)
