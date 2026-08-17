@@ -15,7 +15,9 @@ class VADConfig:
     start_threshold: float = 350.0
     end_threshold: float = 280.0
     start_frames: int = 2
-    end_frames: int = 40
+    # Give natural pauses more room before ending a turn.
+    # At 20 ms frames this is ~1.2 s of sustained silence.
+    end_frames: int = 60
     max_turn_seconds: float = 15.0
 
 
