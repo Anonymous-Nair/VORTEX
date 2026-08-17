@@ -1,5 +1,6 @@
 from pathlib import Path
 import ast
+import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "core"
@@ -23,23 +24,25 @@ EXPECTED_CORE = {
 }
 
 
-def test_core_layout_is_complete() -> None:
-    assert CORE.is_dir()
-    assert {p.name for p in CORE.iterdir()} >= EXPECTED_CORE
+class ArchitectureTests(unittest.TestCase):
+    def test_core_layout_is_complete(self) -> None:
+        self.assertTrue(CORE.is_dir())
+        self.assertTrue(EXPECTED_CORE <= {p.name for p in CORE.iterdir()})
+
+    def test_core_python_is_syntactically_valid(self) -> None:
+        for path in CORE.glob("*.py"):
+            ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+
+    def test_agent_runtime_uses_public_tool_registry_api(self) -> None:
+        source = (CORE / "agent_runtime.py").read_text(encoding="utf-8-sig")
+        self.assertIn("self.tools.execute(", source)
+        self.assertNotIn("self.tools.execute_tool(", source)
+
+    def test_realtime_entrypoint_targets_core_package(self) -> None:
+        source = (ROOT / "realtime_app.py").read_text(encoding="utf-8-sig")
+        self.assertIn("from core.live_audio import LiveAudioSession", source)
+        self.assertIn("from core.realtime_engine import RealtimeEngine", source)
 
 
-def test_core_python_is_syntactically_valid() -> None:
-    for path in CORE.glob("*.py"):
-        ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
-
-
-def test_agent_runtime_uses_public_tool_registry_api() -> None:
-    source = (CORE / "agent_runtime.py").read_text(encoding="utf-8-sig")
-    assert "self.tools.execute(" in source
-    assert "self.tools.execute_tool(" not in source
-
-
-def test_realtime_entrypoint_targets_core_package() -> None:
-    source = (ROOT / "realtime_app.py").read_text(encoding="utf-8-sig")
-    assert "from core.live_audio import LiveAudioSession" in source
-    assert "from core.realtime_engine import RealtimeEngine" in source
+if __name__ == "__main__":
+    unittest.main()
