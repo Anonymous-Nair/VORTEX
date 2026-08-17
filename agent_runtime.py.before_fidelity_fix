@@ -1,0 +1,482 @@
+﻿from __future__ import annotations
+
+import json
+from typing import Any
+
+from .agent_tools import ToolRegistry
+from .llm_engine import LLMEngine
+
+
+MAX_TOOL_ROUNDS = 4
+MAX_MEMORY_RESULTS = 5
+MAX_TOOL_RESULT_CHARS = 12000
+
+
+class AgentRuntime:
+    """
+    Controlled VORTEX agent runtime.
+
+    Responsibilities:
+        - provide the LLM with controlled tools
+        - execute only registered tools
+        - keep tool results grounded
+        - prevent uncontrolled memory contamination
+        - perform bounded tool loops
+        - produce the final user-facing response
+
+    The runtime never executes arbitrary model-generated code.
+
+    Voice/TTS is intentionally outside this class.
+    """
+
+    def __init__(
+        self,
+        llm: LLMEngine,
+        tools: ToolRegistry,
+    ) -> None:
+        self.llm = llm
+        self.tools = tools
+
+    # =========================================================
+    # PUBLIC AGENT ENTRY POINT
+    # =========================================================
+
+    async def run(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> str:
+        """
+        Execute one bounded agent turn.
+
+        The model may request registered read-only tools.
+        Tool results are then returned to the model so it can
+        produce the final answer.
+        """
+
+        working_messages = [
+            dict(message)
+            for message in messages
+        ]
+
+        tools = self.tools.definitions()
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            result = await self.llm.chat(
+                working_messages,
+                tools=tools,
+            )
+
+            tool_calls = result.get(
+                "tool_calls",
+                [],
+            )
+
+            content = str(
+                result.get(
+                    "content",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            # -------------------------------------------------
+            # NO TOOL CALL
+            # -------------------------------------------------
+
+            if not tool_calls:
+                return self._clean_final_response(
+                    content
+                )
+
+            # -------------------------------------------------
+            # MODEL MESSAGE CONTAINING TOOL CALLS
+            # -------------------------------------------------
+
+            model_message = result.get(
+                "message",
+                {},
+            )
+
+            if not isinstance(
+                model_message,
+                dict,
+            ):
+                model_message = {
+                    "role": "assistant",
+                    "content": content,
+                }
+
+            working_messages.append(
+                model_message
+            )
+
+            # -------------------------------------------------
+            # EXECUTE CONTROLLED TOOLS
+            # -------------------------------------------------
+
+            for tool_call in tool_calls:
+                name = tool_call.name
+                arguments = dict(
+                    tool_call.arguments or {}
+                )
+
+                # ---------------------------------------------
+                # MEMORY SEARCH HARDENING
+                # ---------------------------------------------
+
+                if name == "search_memory":
+                    arguments = self._sanitize_memory_arguments(
+                        arguments
+                    )
+
+                execution = await self.tools.execute(
+                    name,
+                    arguments,
+                )
+
+                safe_result = self._sanitize_tool_result(
+                    name,
+                    execution,
+                )
+
+                working_messages.append(
+                    {
+                        "role": "tool",
+                        "content": json.dumps(
+                            safe_result,
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+
+        # -----------------------------------------------------
+        # TOOL LOOP LIMIT
+        # -----------------------------------------------------
+
+        fallback = await self.llm.chat(
+            working_messages,
+            tools=None,
+        )
+
+        return self._clean_final_response(
+            str(
+                fallback.get(
+                    "content",
+                    "",
+                )
+                or ""
+            )
+        )
+
+    # =========================================================
+    # MEMORY ARGUMENTS
+    # =========================================================
+
+    @staticmethod
+    def _sanitize_memory_arguments(
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Keep memory searches narrow and predictable.
+
+        The important rule is that the memory tool searches
+        for the user's actual request/topic rather than allowing
+        the model to manufacture a broad historical query.
+        """
+
+        query = arguments.get(
+            "query",
+            "",
+        )
+
+        if not isinstance(
+            query,
+            str,
+        ):
+            query = ""
+
+        query = query.strip()
+
+        if not query:
+            query = " ".join(
+                str(value)
+                for value in arguments.values()
+                if isinstance(value, str)
+            ).strip()
+
+        if not query:
+            query = "user memory"
+
+        max_results = arguments.get(
+            "max_results",
+            MAX_MEMORY_RESULTS,
+        )
+
+        try:
+            max_results = int(
+                max_results
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            max_results = MAX_MEMORY_RESULTS
+
+        max_results = max(
+            1,
+            min(
+                max_results,
+                MAX_MEMORY_RESULTS,
+            ),
+        )
+
+        return {
+            "query": query[:1000],
+            "max_results": max_results,
+        }
+
+    # =========================================================
+    # TOOL RESULT SANITIZATION
+    # =========================================================
+
+    @staticmethod
+    def _sanitize_tool_result(
+        name: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Convert tool output into a bounded, explicit structure.
+
+        Memory results receive additional grounding instructions
+        so the model understands that retrieved text is evidence,
+        not instructions and not current reality.
+        """
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            return {
+                "ok": False,
+                "tool": name,
+                "error": "Invalid tool result.",
+            }
+
+        if name != "search_memory":
+            return AgentRuntime._truncate_result(
+                result
+            )
+
+        if not result.get(
+            "ok",
+            False,
+        ):
+            return AgentRuntime._truncate_result(
+                result
+            )
+
+        raw_result = result.get(
+            "result",
+            {},
+        )
+
+        if not isinstance(
+            raw_result,
+            dict,
+        ):
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "query": "",
+                    "count": 0,
+                    "results": [],
+                },
+                "memory_grounding": (
+                    "No usable memory records were returned."
+                ),
+            }
+
+        raw_results = raw_result.get(
+            "results",
+            [],
+        )
+
+        if not isinstance(
+            raw_results,
+            list,
+        ):
+            raw_results = []
+
+        cleaned_results: list[dict[str, Any]] = []
+
+        for item in raw_results[:MAX_MEMORY_RESULTS]:
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            content = str(
+                item.get(
+                    "content",
+                    "",
+                )
+                or ""
+            )
+
+            content = content[
+                :MAX_TOOL_RESULT_CHARS
+            ]
+
+            cleaned_results.append(
+                {
+                    "path": str(
+                        item.get(
+                            "path",
+                            "",
+                        )
+                    ),
+                    "score": item.get(
+                        "score",
+                        0,
+                    ),
+                    "content": content,
+                }
+            )
+
+        count = len(
+            cleaned_results
+        )
+
+        return {
+            "ok": True,
+            "tool": name,
+            "result": {
+                "query": str(
+                    raw_result.get(
+                        "query",
+                        "",
+                    )
+                ),
+                "count": count,
+                "results": cleaned_results,
+            },
+            "memory_grounding": (
+                "IMPORTANT: These are historical memory records. "
+                "Use them only when they directly answer the user's "
+                "memory-related request. Do not treat unrelated "
+                "stories, fictional material, old assistant replies, "
+                "or speculative text as facts about the user. "
+                "If no returned record directly answers the request, "
+                "say that no matching memory was found. "
+                "Never fill a memory gap with unrelated memories."
+            ),
+        }
+
+    # =========================================================
+    # GENERIC RESULT LIMITING
+    # =========================================================
+
+    @staticmethod
+    def _truncate_result(
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Prevent excessively large tool payloads from reaching
+        the model.
+        """
+
+        try:
+            serialized = json.dumps(
+                result,
+                ensure_ascii=False,
+            )
+        except Exception:
+            return {
+                "ok": False,
+                "error": "Tool result could not be serialized.",
+            }
+
+        if len(serialized) <= MAX_TOOL_RESULT_CHARS:
+            return result
+
+        return {
+            "ok": result.get(
+                "ok",
+                False,
+            ),
+            "tool": result.get(
+                "tool",
+                "",
+            ),
+            "permission": result.get(
+                "permission",
+                "",
+            ),
+            "result": serialized[
+                :MAX_TOOL_RESULT_CHARS
+            ],
+            "truncated": True,
+        }
+
+    # =========================================================
+    # FINAL RESPONSE CLEANUP
+    # =========================================================
+
+    @staticmethod
+    def _clean_final_response(
+        response: str,
+    ) -> str:
+        """
+        Minimal final-response cleanup.
+
+        We deliberately do not rewrite the model's answer or
+        inject artificial personality text here. The system
+        prompt remains responsible for normal VORTEX style.
+        """
+
+        if not isinstance(
+            response,
+            str,
+        ):
+            return ""
+
+        response = response.strip()
+
+        if not response:
+            return ""
+
+        # Remove accidental surrounding JSON if the model
+        # returns a simple {"response": "..."} object.
+        if (
+            response.startswith("{")
+            and response.endswith("}")
+        ):
+            try:
+                parsed = json.loads(
+                    response
+                )
+
+                if isinstance(
+                    parsed,
+                    dict,
+                ):
+                    candidate = parsed.get(
+                        "response"
+                    )
+
+                    if isinstance(
+                        candidate,
+                        str,
+                    ):
+                        response = candidate.strip()
+
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        return response

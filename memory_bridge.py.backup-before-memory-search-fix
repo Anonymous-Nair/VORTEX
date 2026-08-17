@@ -1,0 +1,530 @@
+﻿from __future__ import annotations
+
+import re
+from datetime import datetime
+from pathlib import Path
+
+
+class VortexMemory:
+    """
+    Local memory layer for VORTEX.
+
+    Uses the Obsidian vault directly through the filesystem.
+    No external API, database, or cloud service required.
+
+    Memory retrieval is intentionally conservative:
+    - Specific terms such as names, topics, and unique nouns may
+      retrieve with a single keyword.
+    - Generic/common words are filtered.
+    - Exact phrase matches receive a strong relevance bonus.
+    - Real-time queries are prevented from being polluted by
+      historical conversation memory.
+    """
+
+    def __init__(self, vault: str = r"E:\DedSec\VORTEX"):
+        self.vault = Path(vault)
+
+        self.identity = self.vault / "Identity"
+        self.memory = self.vault / "Memory"
+        self.long_term = self.memory / "Long_Term"
+        self.conversations = self.memory / "Conversation_Dumps"
+        self.decisions = self.memory / "Decisions"
+        self.preferences = self.memory / "Preferences"
+
+        self.knowledge = self.vault / "Knowledge"
+        self.projects = self.vault / "Projects"
+        self.tasks = self.vault / "Tasks"
+        self.system = self.vault / "System"
+
+        self._ensure_structure()
+
+    # ---------------------------------------------------------
+    # STRUCTURE
+    # ---------------------------------------------------------
+
+    def _ensure_structure(self) -> None:
+        folders = [
+            self.identity,
+            self.memory,
+            self.long_term,
+            self.conversations,
+            self.decisions,
+            self.preferences,
+            self.knowledge,
+            self.projects,
+            self.tasks,
+            self.system,
+        ]
+
+        for folder in folders:
+            folder.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+    # ---------------------------------------------------------
+    # DAILY CONVERSATION MEMORY
+    # ---------------------------------------------------------
+
+    def save_conversation(
+        self,
+        user_text: str,
+        assistant_text: str,
+    ) -> Path:
+        now = datetime.now()
+
+        filename = (
+            f"{now:%Y-%m-%d}_Conversation_Dump.md"
+        )
+
+        path = self.conversations / filename
+
+        timestamp = now.strftime("%H:%M:%S")
+
+        if not path.exists():
+            path.write_text(
+                f"# VORTEX Conversation — "
+                f"{now:%Y-%m-%d}\n\n",
+                encoding="utf-8",
+            )
+
+        with path.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+            file.write(
+                f"## {timestamp}\n\n"
+                f"**Sir:**\n"
+                f"{user_text.strip()}\n\n"
+                f"**VORTEX:**\n"
+                f"{assistant_text.strip()}\n\n"
+                f"---\n\n"
+            )
+
+        return path
+
+    # ---------------------------------------------------------
+    # SEARCH MEMORY
+    # ---------------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 8,
+        min_score: int = 2,
+    ) -> list[dict]:
+        query = query.strip()
+
+        if not query:
+            return []
+
+        # -----------------------------------------------------
+        # REAL-TIME QUERY PROTECTION
+        # -----------------------------------------------------
+        #
+        # Historical memory should never answer a request that
+        # specifically requires live machine information.
+        #
+        # The actual tool system handles these requests.
+        #
+        lowered_query = query.lower()
+
+        realtime_patterns = (
+            r"\bcurrent\s+time\b",
+            r"\bwhat\s+time\s+is\s+it\b",
+            r"\btime\s+right\s+now\b",
+            r"\bcurrent\s+date\b",
+            r"\btoday'?s\s+date\b",
+            r"\bwhat\s+day\s+is\s+it\b",
+            r"\bright\s+now\b",
+            r"\blocal\s+time\b",
+            r"\blocal\s+date\b",
+        )
+
+        if any(
+            re.search(
+                pattern,
+                lowered_query,
+            )
+            for pattern in realtime_patterns
+        ):
+            return []
+
+        # -----------------------------------------------------
+        # KEYWORD EXTRACTION
+        # -----------------------------------------------------
+
+        query_words = self._keywords(
+            query
+        )
+
+        if not query_words:
+            return []
+
+        # -----------------------------------------------------
+        # EXACT PHRASE
+        # -----------------------------------------------------
+
+        normalized_query = re.sub(
+            r"\s+",
+            " ",
+            lowered_query,
+        ).strip()
+
+        results = []
+
+        for path in self.vault.rglob("*.md"):
+            try:
+                text = path.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+            except Exception:
+                continue
+
+            if not text.strip():
+                continue
+
+            lowered = text.lower()
+
+            # -------------------------------------------------
+            # KEYWORD MATCHES
+            # -------------------------------------------------
+
+            matched_words = [
+                word
+                for word in query_words
+                if word in lowered
+            ]
+
+            if not matched_words:
+                continue
+
+            distinct_matches = len(
+                set(matched_words)
+            )
+
+            occurrence_score = sum(
+                lowered.count(word)
+                for word in set(matched_words)
+            )
+
+            # -------------------------------------------------
+            # RELEVANCE SCORE
+            # -------------------------------------------------
+
+            score = 0
+
+            # Every distinct keyword contributes.
+            score += distinct_matches * 4
+
+            # Repeated occurrence gives additional evidence,
+            # but does not dominate the ranking.
+            score += min(
+                occurrence_score,
+                10,
+            )
+
+            # Exact phrase is strong evidence.
+            if (
+                normalized_query
+                and normalized_query in lowered
+            ):
+                score += 20
+
+            # -------------------------------------------------
+            # SINGLE-KEYWORD SAFETY
+            # -------------------------------------------------
+            #
+            # A single keyword is allowed only when it is a
+            # meaningful keyword. Common conversational words
+            # have already been removed by _keywords().
+            #
+            # This lets:
+            #
+            #     "mango"
+            #
+            # find the mango conversation while preventing
+            # generic words such as "what" or "you" from
+            # producing huge amounts of noise.
+            #
+            if distinct_matches == 1:
+                matched_word = matched_words[0]
+
+                if (
+                    len(matched_word) < 4
+                    and occurrence_score < 2
+                ):
+                    continue
+
+            # Minimum relevance threshold.
+            if score < min_score:
+                continue
+
+            results.append(
+                {
+                    "path": str(path),
+                    "score": score,
+                    "content": text,
+                    "matched_keywords": sorted(
+                        set(matched_words)
+                    ),
+                }
+            )
+
+        # -----------------------------------------------------
+        # SORT
+        # -----------------------------------------------------
+
+        results.sort(
+            key=lambda item: (
+                item["score"],
+                len(item["matched_keywords"]),
+            ),
+            reverse=True,
+        )
+
+        return results[
+            :max_results
+        ]
+
+    # ---------------------------------------------------------
+    # BUILD MEMORY CONTEXT FOR LLM
+    # ---------------------------------------------------------
+
+    def build_context(
+        self,
+        query: str,
+        max_results: int = 5,
+        max_chars: int = 12000,
+    ) -> str:
+        results = self.search(
+            query,
+            max_results=max_results,
+        )
+
+        if not results:
+            return ""
+
+        sections = []
+
+        total_chars = 0
+
+        for result in results:
+            content = result[
+                "content"
+            ].strip()
+
+            remaining = (
+                max_chars
+                - total_chars
+            )
+
+            if remaining <= 0:
+                break
+
+            content = content[
+                :remaining
+            ]
+
+            sections.append(
+                "[MEMORY SOURCE]\n"
+                f"{result['path']}\n"
+                f"[RELEVANCE SCORE: "
+                f"{result['score']}]\n"
+                f"[MATCHED KEYWORDS: "
+                f"{', '.join(result.get('matched_keywords', []))}]\n\n"
+                f"{content}\n"
+            )
+
+            total_chars += len(
+                content
+            )
+
+        if not sections:
+            return ""
+
+        return (
+            "\n\n"
+            "===== VORTEX RELEVANT MEMORY =====\n"
+            + "\n\n".join(sections)
+            + "\n===== END VORTEX MEMORY =====\n"
+        )
+
+    # ---------------------------------------------------------
+    # STORE LONG-TERM MEMORY
+    # ---------------------------------------------------------
+
+    def save_long_term(
+        self,
+        title: str,
+        content: str,
+    ) -> Path:
+        safe_title = self._safe_filename(
+            title
+        )
+
+        path = (
+            self.long_term
+            / f"{safe_title}.md"
+        )
+
+        path.write_text(
+            f"# {title}\n\n"
+            f"{content.strip()}\n",
+            encoding="utf-8",
+        )
+
+        return path
+
+    # ---------------------------------------------------------
+    # STORE DECISION
+    # ---------------------------------------------------------
+
+    def save_decision(
+        self,
+        title: str,
+        content: str,
+    ) -> Path:
+        safe_title = self._safe_filename(
+            title
+        )
+
+        path = (
+            self.decisions
+            / f"{safe_title}.md"
+        )
+
+        path.write_text(
+            f"# {title}\n\n"
+            f"{content.strip()}\n",
+            encoding="utf-8",
+        )
+
+        return path
+
+    # ---------------------------------------------------------
+    # STORE PREFERENCE
+    # ---------------------------------------------------------
+
+    def save_preference(
+        self,
+        title: str,
+        content: str,
+    ) -> Path:
+        safe_title = self._safe_filename(
+            title
+        )
+
+        path = (
+            self.preferences
+            / f"{safe_title}.md"
+        )
+
+        path.write_text(
+            f"# {title}\n\n"
+            f"{content.strip()}\n",
+            encoding="utf-8",
+        )
+
+        return path
+
+    # ---------------------------------------------------------
+    # HELPERS
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _keywords(
+        text: str,
+    ) -> list[str]:
+        words = re.findall(
+            r"[a-zA-Z0-9_]+",
+            text.lower(),
+        )
+
+        stopwords = {
+            "the",
+            "and",
+            "for",
+            "that",
+            "this",
+            "with",
+            "what",
+            "when",
+            "where",
+            "how",
+            "why",
+            "are",
+            "was",
+            "were",
+            "you",
+            "your",
+            "can",
+            "could",
+            "would",
+            "should",
+            "does",
+            "did",
+            "have",
+            "has",
+            "from",
+            "into",
+            "about",
+            "please",
+            "vortex",
+            "sir",
+            "hey",
+            "hi",
+            "hello",
+            "hiya",
+            "there",
+            "yeah",
+            "yep",
+            "nope",
+            "okay",
+            "thanks",
+            "thank",
+            "welcome",
+            "tell",
+            "told",
+            "said",
+            "say",
+            "give",
+            "gave",
+            "know",
+            "thing",
+            "things",
+            "something",
+            "someone",
+            "somebody",
+            "didnt",
+            "didn't",
+        }
+
+        return [
+            word
+            for word in words
+            if len(word) >= 3
+            and word not in stopwords
+        ]
+
+    @staticmethod
+    def _safe_filename(
+        title: str,
+    ) -> str:
+        title = re.sub(
+            r'[<>:"/\\|?*]',
+            "_",
+            title,
+        )
+
+        title = re.sub(
+            r"\s+",
+            " ",
+            title,
+        ).strip()
+
+        return (
+            title[:120]
+            or "Untitled"
+        )
