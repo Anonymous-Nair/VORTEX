@@ -14,11 +14,13 @@ class BargeInConfig:
     min_delay_samples: int = 320
     max_delay_samples: int = 3200
     search_step: int = 8
-    mic_floor: float = 450.0
-    residual_floor: float = 180.0
-    residual_ratio: float = 2.2
-    residual_margin: float = 180.0
-    confirm_frames: int = 5
+    # Require a substantially stronger signal before considering an interruption.
+    mic_floor: float = 900.0
+    residual_floor: float = 700.0
+    residual_ratio: float = 3.5
+    residual_margin: float = 500.0
+    # Require a longer continuous run to distinguish intentional speech from transients.
+    confirm_frames: int = 7
     startup_suppression_ms: float = 300.0
     baseline_attack: float = 0.02
     baseline_release: float = 0.10
