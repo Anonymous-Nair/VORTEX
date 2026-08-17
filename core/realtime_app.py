@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import asyncio
+import time
+
+import requests
+
+from core.live_audio import LiveAudioSession
+from core.realtime_engine import RealtimeEngine
+
+
+TTS_HEALTH = "http://127.0.0.1:8892/health"
+
+
+async def main() -> None:
+    print("=" * 60)
+    print("VORTEX REALTIME LIVE ENGINE")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # HEALTH CHECK
+    # --------------------------------------------------------
+
+    print("\nChecking TTS...")
+
+    try:
+        response = requests.get(
+            TTS_HEALTH,
+            timeout=5,
+        )
+        response.raise_for_status()
+        print("[OK] TTS:", response.json())
+    except Exception as exc:
+        print("[ERROR] TTS unavailable:", exc)
+        print("Start the VORTEX TTS server first.")
+        return
+
+    # --------------------------------------------------------
+    # CREATE ENGINES
+    # --------------------------------------------------------
+
+    realtime = RealtimeEngine()
+    audio = LiveAudioSession(
+        events=realtime.events
+    )
+
+    # --------------------------------------------------------
+    # WIRE TTS PLAYBACK CALLBACK TO BARGE-IN DETECTOR
+    # --------------------------------------------------------
+    # This ensures the suppression window starts exactly when
+    # audio hits the speakers, not when generation starts.
+    realtime.tts.set_playback_started_callback(audio.get_barge_start_callback())
+
+    # --------------------------------------------------------
+    # EVENT MONITOR
+    # --------------------------------------------------------
+
+    events = realtime.events.subscribe()
+
+    # Number of TTS speech jobs currently active or queued.
+    # Microphone must remain gated until ALL speech is finished.
+    speech_jobs = 0
+
+    async def event_monitor() -> None:
+        nonlocal speech_jobs
+
+        while True:
+            event = await events.get()
+
+            if event.type == "audio.ready":
+                print("[OK] Microphone engine ready")
+
+            elif event.type == "speech.started":
+                print("\n[MIC] USER SPEAKING")
+
+            elif event.type == "speech.ended":
+                print("[MIC] USER FINISHED SPEAKING")
+
+            elif event.type == "stt.final":
+                print(
+                    f"[STT] {event.data.get('text', '')}"
+                )
+
+                # Feed finalized speech directly into
+                # the real-time brain.
+                asyncio.create_task(
+                    realtime.handle_text(
+                        event.data["text"]
+                    )
+                )
+
+            elif event.type == "assistant.thinking":
+                print("[BRAIN] VORTEX THINKING")
+
+            elif event.type == "llm.token":
+                # Keep token output minimal in live mode.
+                pass
+
+            elif event.type == "tts.started":
+                speech_jobs += 1
+                audio.set_speaking(True)
+
+                print(
+                    f"[TTS] VORTEX SPEAKING: ",
+                    f"{event.data.get('text', '')}"
+                )
+
+            elif event.type == "tts.completed":
+                speech_jobs = max(0, speech_jobs - 1)
+
+                # Only reopen the microphone after EVERY queued
+                # speech job has completed.
+                audio.set_speaking(speech_jobs > 0)
+
+                print("[OK] VORTEX SPEECH COMPLETE")
+
+            elif event.type == "tts.error":
+                speech_jobs = max(0, speech_jobs - 1)
+                audio.set_speaking(speech_jobs > 0)
+
+                print("[ERROR] TTS ERROR:",
+                    event.data.get("error")
+                )
+
+            elif event.type == "assistant.interrupted":
+                speech_jobs = 0
+                audio.set_speaking(False)
+
+                print("[BARGE-IN] VORTEX INTERRUPTED")
+
+            elif event.type == "assistant.completed":
+                print(
+                    f"[BRAIN] VORTEX COMPLETE: ",
+                    f"{event.data.get('response', '')}"
+                )
+
+    # --------------------------------------------------------
+    # EVENT BRIDGE
+    # --------------------------------------------------------
+
+    async def interruption_bridge() -> None:
+        interrupt_events = realtime.events.subscribe()
+
+        while True:
+            event = await interrupt_events.get()
+
+            if event.type == "assistant.interrupted":
+                realtime.interrupt(notify=False)
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    print("\n========================================")
+    print(" VORTEX REALTIME ONLINE")
+    print("========================================")
+    print("[MIC] Continuous microphone")
+    print("[BRAIN] Qwen3.5 4B / think:false")
+    print("[TTS] Qwen3-TTS / 24 kHz")
+    print("[BARGE-IN] Enabled")
+    print("")
+    print("Speak normally.")
+    print("Press Ctrl+C to stop.")
+    print("")
+
+    monitor_task = asyncio.create_task(
+        event_monitor()
+    )
+
+    interrupt_task = asyncio.create_task(
+        interruption_bridge()
+    )
+
+    try:
+        await audio.run()
+
+    except KeyboardInterrupt:
+        print("\nStopping VORTEX...")
+
+    finally:
+        monitor_task.cancel()
+        interrupt_task.cancel()
+
+        audio.stop()
+
+        await realtime.close()
+
+        print("VORTEX realtime engine stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("")
+        print("=" * 60)
+        print(" VORTEX SHUTDOWN")
+        print("=" * 60)
+        print("[OK] VORTEX stopped cleanly.")
