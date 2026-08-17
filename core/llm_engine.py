@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-import requests
+import httpx
 
 
 @dataclass(slots=True)
@@ -65,10 +64,6 @@ class LLMEngine:
         self.url = url
         self.model = model
 
-    # =========================================================
-    # COMMON PAYLOAD
-    # =========================================================
-
     def _build_payload(
         self,
         messages: list[dict[str, Any]],
@@ -95,329 +90,131 @@ class LLMEngine:
 
         return payload
 
-    # =========================================================
-    # NORMAL TEXT STREAM
-    # =========================================================
-
     async def stream(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[tuple[str, float]]:
-        """
-        Backwards-compatible text streaming interface.
-
-        Existing VORTEX code can continue using:
-
-            async for piece, elapsed in llm.stream(...):
-
-        Tool calls are intentionally not returned through this
-        legacy interface. The agent-aware interface below should
-        be used when tool calling is required.
-        """
-
-        async for event in self.stream_events(
-            messages,
-            tools=tools,
-        ):
+        async for event in self.stream_events(messages, tools=tools):
             if event.kind == "text" and event.text:
                 yield event.text, event.elapsed
-
             elif event.kind == "done":
                 break
-
-    # =========================================================
-    # AGENT-AWARE STREAM
-    # =========================================================
 
     async def stream_events(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[LLMStreamEvent]:
-        """
-        Stream normalized LLM events.
-
-        Events may contain:
-
-            text
-            tool_call
-            done
-
-        The LLM only requests tools here.
-
-        It never executes them.
-        """
-
-        payload = self._build_payload(
-            messages,
-            stream=True,
-            tools=tools,
-        )
-
+        payload = self._build_payload(messages, stream=True, tools=tools)
         started = time.perf_counter()
+        timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
 
-        response = await asyncio.to_thread(
-            requests.post,
-            self.url,
-            json=payload,
-            timeout=120,
-            stream=True,
-        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", self.url, json=payload) as response:
+                response.raise_for_status()
 
-        response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
 
-        try:
-            for line in response.iter_lines(
-                decode_unicode=True
-            ):
-                if not line:
-                    continue
+                    try:
+                        packet = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
 
-                try:
-                    packet = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                    elapsed = time.perf_counter() - started
+                    message = packet.get("message", {})
 
-                elapsed = (
-                    time.perf_counter() - started
-                )
-
-                message = packet.get(
-                    "message",
-                    {},
-                )
-
-                # -------------------------------------------------
-                # NORMAL GENERATED TEXT
-                # -------------------------------------------------
-
-                piece = message.get(
-                    "content",
-                    "",
-                )
-
-                if piece:
-                    yield LLMStreamEvent(
-                        kind="text",
-                        text=piece,
-                        elapsed=elapsed,
-                        raw=packet,
-                    )
-
-                # -------------------------------------------------
-                # TOOL CALLS
-                # -------------------------------------------------
-
-                tool_calls = message.get(
-                    "tool_calls",
-                    [],
-                )
-
-                if tool_calls:
-                    for raw_call in tool_calls:
-                        normalized = (
-                            self._normalize_tool_call(
-                                raw_call
-                            )
-                        )
-
-                        if normalized is None:
-                            continue
-
+                    piece = message.get("content", "")
+                    if piece:
                         yield LLMStreamEvent(
-                            kind="tool_call",
+                            kind="text",
+                            text=piece,
                             elapsed=elapsed,
-                            tool_call=normalized,
                             raw=packet,
                         )
 
-                # -------------------------------------------------
-                # END OF STREAM
-                # -------------------------------------------------
+                    tool_calls = message.get("tool_calls", [])
+                    if tool_calls:
+                        for raw_call in tool_calls:
+                            normalized = self._normalize_tool_call(raw_call)
+                            if normalized is None:
+                                continue
+                            yield LLMStreamEvent(
+                                kind="tool_call",
+                                elapsed=elapsed,
+                                tool_call=normalized,
+                                raw=packet,
+                            )
 
-                if packet.get("done"):
-                    yield LLMStreamEvent(
-                        kind="done",
-                        elapsed=elapsed,
-                        raw=packet,
-                    )
-                    break
-
-        finally:
-            response.close()
-
-    # =========================================================
-    # NON-STREAMING CHAT
-    # =========================================================
+                    if packet.get("done"):
+                        yield LLMStreamEvent(
+                            kind="done",
+                            elapsed=elapsed,
+                            raw=packet,
+                        )
+                        break
 
     async def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """
-        Perform one non-streaming Ollama chat request.
+        payload = self._build_payload(messages, stream=False, tools=tools)
+        timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
 
-        This is useful for the agent loop when the model needs
-        to make a tool decision before producing the final
-        spoken response.
-        """
-
-        payload = self._build_payload(
-            messages,
-            stream=False,
-            tools=tools,
-        )
-
-        response = await asyncio.to_thread(
-            requests.post,
-            self.url,
-            json=payload,
-            timeout=120,
-            stream=False,
-        )
-
-        response.raise_for_status()
-
-        try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(self.url, json=payload)
+            response.raise_for_status()
             packet = response.json()
-        finally:
-            response.close()
 
-        message = packet.get(
-            "message",
-            {},
-        )
-
-        content = message.get(
-            "content",
-            "",
-        )
-
-        raw_tool_calls = message.get(
-            "tool_calls",
-            [],
-        )
+        message = packet.get("message", {})
+        content = message.get("content", "")
+        raw_tool_calls = message.get("tool_calls", [])
 
         tool_calls: list[LLMToolCall] = []
-
         for raw_call in raw_tool_calls:
-            normalized = self._normalize_tool_call(
-                raw_call
-            )
-
+            normalized = self._normalize_tool_call(raw_call)
             if normalized is not None:
-                tool_calls.append(
-                    normalized
-                )
+                tool_calls.append(normalized)
 
         return {
             "message": message,
             "content": content,
             "tool_calls": tool_calls,
-            "done": bool(
-                packet.get("done")
-            ),
+            "done": bool(packet.get("done")),
             "raw": packet,
         }
 
-    # =========================================================
-    # TOOL CALL NORMALIZATION
-    # =========================================================
-
     @staticmethod
-    def _normalize_tool_call(
-        raw_call: Any,
-    ) -> LLMToolCall | None:
-        """
-        Normalize the tool-call structures returned by
-        Ollama-compatible APIs.
-
-        Expected structure is normally:
-
-            {
-                "function": {
-                    "name": "...",
-                    "arguments": {...}
-                }
-            }
-
-        A few compatible formats are tolerated so the agent
-        layer does not depend on provider-specific details.
-        """
-
-        if not isinstance(
-            raw_call,
-            dict,
-        ):
+    def _normalize_tool_call(raw_call: Any) -> LLMToolCall | None:
+        if not isinstance(raw_call, dict):
             return None
 
-        function = raw_call.get(
-            "function",
-            {},
-        )
-
-        if not isinstance(
-            function,
-            dict,
-        ):
+        function = raw_call.get("function", {})
+        if not isinstance(function, dict):
             return None
 
-        name = function.get(
-            "name",
-            "",
-        )
-
-        if not isinstance(
-            name,
-            str,
-        ):
+        name = function.get("name", "")
+        if not isinstance(name, str):
             return None
-
         name = name.strip()
-
         if not name:
             return None
 
-        arguments = function.get(
-            "arguments",
-            {},
-        )
-
-        # Ollama normally supplies a dictionary, but some
-        # OpenAI-compatible implementations may serialize
-        # arguments as JSON text.
-        if isinstance(
-            arguments,
-            str,
-        ):
+        arguments = function.get("arguments", {})
+        if isinstance(arguments, str):
             try:
-                arguments = json.loads(
-                    arguments
-                )
+                arguments = json.loads(arguments)
             except json.JSONDecodeError:
                 arguments = {}
 
-        if not isinstance(
-            arguments,
-            dict,
-        ):
+        if not isinstance(arguments, dict):
             arguments = {}
 
-        call_id = raw_call.get(
-            "id",
-            "",
-        )
-
-        if not isinstance(
-            call_id,
-            str,
-        ):
+        call_id = raw_call.get("id", "")
+        if not isinstance(call_id, str):
             call_id = ""
 
-        return LLMToolCall(
-            name=name,
-            arguments=arguments,
-            call_id=call_id,
-        )
+        return LLMToolCall(name=name, arguments=arguments, call_id=call_id)
